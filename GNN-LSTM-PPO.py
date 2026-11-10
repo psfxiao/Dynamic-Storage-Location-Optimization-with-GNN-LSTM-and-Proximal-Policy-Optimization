@@ -1,3 +1,4 @@
+
 import pandas as pd
 import numpy as np
 import torch
@@ -64,9 +65,11 @@ class SalesDataLoader:
         if COL_ORDER_DATE in self.order_df.columns:
             if any('月' in str(x) for x in self.order_df[COL_ORDER_DATE].head()):
                 self.order_df[COL_ORDER_DATE] = '2025年' + self.order_df[COL_ORDER_DATE].astype(str)
-                self.order_df[COL_ORDER_DATE] = pd.to_datetime(self.order_df[COL_ORDER_DATE], format='%Y年%m月%d日', errors='coerce')
+                self.order_df[COL_ORDER_DATE] = pd.to_datetime(self.order_df[COL_ORDER_DATE], format='%Y年%m月%d日',
+                                                               errors='coerce')
             elif pd.api.types.is_numeric_dtype(self.order_df[COL_ORDER_DATE]):
-                self.order_df[COL_ORDER_DATE] = pd.to_datetime(self.order_df[COL_ORDER_DATE], unit='D', origin='1899-12-30')
+                self.order_df[COL_ORDER_DATE] = pd.to_datetime(self.order_df[COL_ORDER_DATE], unit='D',
+                                                               origin='1899-12-30')
                 self.order_df[COL_ORDER_DATE] = self.order_df[COL_ORDER_DATE].map(lambda x: x.replace(year=2025))
             else:
                 self.order_df[COL_ORDER_DATE] = pd.to_datetime(self.order_df[COL_ORDER_DATE], errors='coerce')
@@ -88,11 +91,28 @@ class SalesDataLoader:
             print(f"Warning: {self.order_df['order_time'].isna().sum()} invalid date-times, dropping rows")
             self.order_df = self.order_df.dropna(subset=['order_time'])
 
-        self.order_df[COL_SKU_LIST] = self.order_df[COL_SKU].apply(lambda x: [s.strip() for s in str(x).split(',')])
+
+        # Add an internal cleaning function to remove spaces and convert to pure string
+        def clean_sku(s):
+            s = str(s).strip()
+            if s.endswith('.0'):
+                s = s[:-2]
+            return s
+
+        # Split and clean all SKUs in the order data, and remove leading zeros  to unify the format
+        self.order_df[COL_SKU_LIST] = self.order_df[COL_SKU].apply(
+            lambda x: [clean_sku(s).lstrip('0') if clean_sku(s).lstrip('0') else '0' for s in str(x).split(',')]
+        )
+
         self.order_df[COL_VOLUME_LIST] = self.order_df[COL_SKU_VOLUMES].apply(
-            lambda x: ast.literal_eval(x) if isinstance(x, str) and x.startswith('[') else [int(v.strip()) for v in str(x).split(',')]
+            lambda x: ast.literal_eval(x) if isinstance(x, str) and x.startswith('[') else [int(v.strip()) for v in
+                                                                                            str(x).split(',')]
         )
         self.sku_sales = {}
+
+
+
+
 
     def _process_sku_sales(self):
         for _, row in self.order_df.iterrows():
@@ -157,8 +177,26 @@ class WarehouseDataLoader:
                             COL_FULLYEAR_RANK, COL_SPRINGSUMMER_RANK, COL_AUTUMNWINTER_RANK}
         assert set(self.df.columns) >= required_columns, f"Missing columns: {required_columns - set(self.df.columns)}"
 
+
+
     def _preprocess_data(self):
+        # === Added: Standardize the SKU column in the warehouse table ===
+        def clean_sku_w(s):
+            s = str(s).strip()
+            if s.endswith('.0'):
+                s = s[:-2]
+            return s.lstrip('0') if s.lstrip('0') else '0'
+
+        self.df[COL_SKU_W] = self.df[COL_SKU_W].apply(clean_sku_w)
+        # =================================
         self.df[COL_RANK_DIFF] = self.df[COL_OVERALL_RANK] - self.df[COL_SPRINGSUMMER_RANK]
+
+
+
+
+
+
+
         self.df[COL_NEED_ADJUST] = np.where(np.abs(self.df[COL_RANK_DIFF]) >= 2000, 1, 0)
         top_k = int(0.2 * len(self.df))
         self.df[COL_HOT] = 0
@@ -313,12 +351,28 @@ class PolicyNetwork(nn.Module):
     def forward(self, states, lstm_datas):
         batch_size = states.size(0)
         num_skus = states.size(1)
-        gnn_data = Data(x=states.view(-1, states.size(-1)), edge_index=self.edge_index)
+
+        fused_features_list = []
         with autocast():
-            fused_features = self.fusion_model(gnn_data, lstm_datas)
+            # Loop through each sample in the batch  to compute graph features independently
+            for i in range(batch_size):
+                state_i = states[i]
+                lstm_data_i = lstm_datas[i:i + 1]
+
+                gnn_data = Data(x=state_i, edge_index=self.edge_index)
+
+                fused_feat = self.fusion_model(gnn_data, lstm_data_i)
+                fused_features_list.append(fused_feat)
+
+            fused_features = torch.cat(fused_features_list, dim=0)
+
             action_logits = self.fc_policy(fused_features)
             state_values = self.fc_value(fused_features)
+
         return action_logits, state_values
+
+
+
 
     def select_action(self, state, lstm_data):
         state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
@@ -366,6 +420,8 @@ class PPO:
             for _ in range(self.n_steps):
                 action = self.policy.select_action(state, lstm_data)
                 next_state, next_lstm_data, reward, done, _ = self.env.step(action)
+
+
                 if reward > -0.5:
                     states.append(state)
                     lstm_datas.append(lstm_data)
@@ -374,6 +430,8 @@ class PPO:
                     next_states.append(next_state)
                     next_lstm_datas.append(next_lstm_data)
                     dones.append(done)
+
+
                 state = next_state
                 lstm_data = next_lstm_data
                 episode_reward += reward
@@ -381,8 +439,11 @@ class PPO:
                 pbar.update(1)
                 if done or timesteps >= total_timesteps:
                     break
+
+
             if len(states) > 0:
                 self.update_policy(states, lstm_datas, actions, rewards, next_states, next_lstm_datas, dones)
+
 
             current_efficiency = self.evaluate_policy()
             if current_efficiency > best_efficiency:
@@ -393,16 +454,16 @@ class PPO:
             self.reward_history.append(episode_reward)
             if len(episode_rewards) % 5 == 0:
                 avg_reward = np.mean(episode_rewards[-5:])
-                tqdm.write(f"Timesteps: {timesteps}, Avg Reward: {avg_reward:.2f}, Best Eff: {best_efficiency:.4f}")
+                tqdm.write(f"Timesteps: {timesteps}, Avg Reward: {avg_reward:.2f}, Best Eff: {best_efficiency:.7f}")
         pbar.close()
         return episode_rewards
 
     def evaluate_policy(self):
-        state, lstm_data = self.env.reset()
-        done = False
         total_efficiency = 0
         eval_episodes = 3
         for _ in range(eval_episodes):
+            state, lstm_data = self.env.reset()
+            done = False
             while not done:
                 action = self.policy.select_action(state, lstm_data)
                 state, lstm_data, _, done, _ = self.env.step(action)
@@ -434,22 +495,36 @@ class PPO:
                 next_lstm_datas_tensor = next_lstm_datas_tensor.to(self.policy.device)
                 dones_tensor = dones_tensor.to(self.policy.device)
 
+
+                # === Fix: value loss in the PPO update ===
                 with torch.no_grad(), autocast():
-                    values = self.policy.value(states_tensor, lstm_datas_tensor)
+                    # Only compute next_values as the target
                     next_values = self.policy.value(next_states_tensor, next_lstm_datas_tensor)
-                    advantages = rewards_tensor + self.gamma * next_values * (1 - dones_tensor) - values
+                    returns = rewards_tensor + self.gamma * next_values * (1 - dones_tensor)
 
                 old_log_probs = self.policy.log_prob(states_tensor, lstm_datas_tensor, actions_tensor).detach()
 
                 self.optimizer.zero_grad()
                 with autocast():
+                    # Values here must retain gradients
+                    values = self.policy.value(states_tensor, lstm_datas_tensor)
+                    # Advantages are only used for the Actor, so detach them
+                    advantages = (returns - values).detach()
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
                     new_log_probs = self.policy.log_prob(states_tensor, lstm_datas_tensor, actions_tensor)
                     ratio = torch.exp(new_log_probs - old_log_probs)
                     surr1 = ratio * advantages
                     surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * advantages
                     policy_loss = -torch.min(surr1, surr2).mean()
-                    value_loss = advantages.pow(2).mean()
+
+                    # Compute MSE Loss using values with gradients
+                    value_loss = nn.MSELoss()(values, returns)
+
                     loss = policy_loss + 0.5 * value_loss
+                # === end ===
+
+
 
                 self.scaler.scale(loss).backward()
                 nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
@@ -640,8 +715,8 @@ class WarehouseEnv(gym.Env):
         dist1 = self.distance_mapping[pos1]
         dist2 = self.distance_mapping[pos2]
         max_dist = max(self.distance_mapping.values())
-        self.state[idx1, 1] = dist2 / max_dist
-        self.state[idx2, 1] = dist1 / max_dist
+        self.state[idx1, 1] = dist1 / max_dist # dist1 correctly belongs to idx1 after swap
+        self.state[idx2, 1] = dist2 / max_dist # dist2 correctly belongs to idx2 after swap
         self.state[idx1, 3] = 0
         self.state[idx2, 3] = 0
 
@@ -652,7 +727,7 @@ def apply_dynamic_adjustment(policy_net, env, data_loader):
     done = False
     adjustments = 0
     improvement_history = []
-    print(f"\nStarting dynamic location adjustment (max {env.max_adjustments} adjustments)...")
+
 
     while not done and adjustments < env.max_adjustments:
         action = policy_net.select_action(state, lstm_data)
@@ -685,17 +760,11 @@ def apply_dynamic_adjustment(policy_net, env, data_loader):
     final_efficiency = env._calculate_overall_efficiency(state)
     improvement = (final_efficiency - env.original_efficiency) / env.original_efficiency * 100
     print(f"\nOptimization completed! {adjustments} effective adjustments performed.")
-    print(f"Initial efficiency: {env.original_efficiency:.4f}")
-    print(f"Final efficiency: {final_efficiency:.4f}")
+    print(f"Initial efficiency: {env.original_efficiency:.7f}")
+    print(f"Final efficiency: {final_efficiency:.7f}")
     print(f"Improvement: {improvement:.2f}%")
 
-    plt.figure(figsize=(10, 5))
-    plt.plot(improvement_history)
-    plt.xlabel('Adjustment Step')
-    plt.ylabel('Efficiency Improvement (%)')
-    plt.title('Warehouse Optimization Progress')
-    plt.savefig("efficiency_improvement.png")
-    plt.close()
+
 
     adjustment_df = pd.DataFrame(env.adjustment_history)
     adjustment_df.to_excel("adjustment_log.xlsx", index=False)
@@ -739,11 +808,53 @@ def main():
     print("Loading warehouse data...")
     warehouse_data_loader = WarehouseDataLoader("initial storage location assignment.xlsx", sales_data_loader)
 
+    # Validate SKU matching rate
+    order_skus = set([sku for sublist in sales_data_loader.order_df[COL_SKU_LIST] for sku in sublist])
+    warehouse_skus = set(warehouse_data_loader.df[COL_SKU_W])
+    matched = order_skus.intersection(warehouse_skus)
+    print(
+        f"Total unique SKUs in orders: {len(order_skus)}, Total unique SKUs in warehouse: {len(warehouse_skus)}, Matched SKUs: {len(matched)}")
+
     print("Creating environment...")
     env = WarehouseEnv(warehouse_data_loader)
 
+    # ================= print: Distance-feature updates =================
+    # print("\n--- Distance-feature updates ---")
+    #state, lstm_data = env.reset()
+
+    # Force a step to trigger the location swap and state update
+    # action = 0
+    # next_state, next_lstm_data, reward, done, info = env.step(action)
+
+    # from_sku = info['from_sku']
+    # to_sku = info['to_sku']
+    # from_idx = env.data_loader.sku_to_id[from_sku]
+    # to_idx = env.data_loader.sku_to_id[to_sku]
+
+    # Retrieve the normalized distance from the state matrix
+    # max_dist = max(env.distance_mapping.values())
+    # state_from_dist = next_state[from_idx, 1] * max_dist
+    # state_to_dist = next_state[to_idx, 1] * max_dist
+
+    # Retrieve the actual physical distance from the dictionary
+    # actual_from_dist = env.distance_mapping[env.sku_to_position[from_sku]]
+    # actual_to_dist = env.distance_mapping[env.sku_to_position[to_sku]]
+
+    # print(f"Swap occurred between SKU {from_sku} and SKU {to_sku}")
+    # print(
+        # f"SKU {from_sku} (idx {from_idx}): Actual physical dist = {actual_from_dist:.2f}, State feature dist = {state_from_dist:.2f}")
+    # print(
+        # f"SKU {to_sku} (idx {to_idx}): Actual physical dist = {actual_to_dist:.2f}, State feature dist = {state_to_dist:.2f}")
+
+    # if abs(actual_from_dist - state_from_dist) < 1e-3 and abs(actual_to_dist - state_to_dist) < 1e-3:
+        # print("Validation PASSED: State distance features perfectly match physical positions.")
+    # else:
+        # print("Validation FAILED: State features do not match physical positions.")
+    # print("----------------------------------------------------------------------------------\n")
+    # ==================================================================================
+
     initial_efficiency = env._calculate_overall_efficiency()
-    print(f"Initial system efficiency: {initial_efficiency:.4f}")
+    print(f"Initial system efficiency: {initial_efficiency:.7f}")
 
     print("Building adjacency matrix...")
     adj_matrix = warehouse_data_loader.get_adjacency_matrix()
@@ -775,6 +886,41 @@ def main():
     print("Initializing PPO...")
     ppo = PPO(policy=policy_net, env=env, learning_rate=1e-4, n_steps=128, batch_size=16, gamma=0.99, clip_epsilon=0.15)
 
+    # print("\n---  PPO Critic Gradient Update ---")
+    # import copy
+    # 1. Record initial weights of the Critic network (the value function)
+    # initial_critic_weights = copy.deepcopy(policy_net.fc_value[0].weight.data.clone())
+
+    # 2. Run 128 steps to trigger exactly one PPO update (n_steps=128 in your PPO init)
+    # print("Running 128 timesteps to trigger one PPO update...")
+    # ppo.learn(total_timesteps=128)
+
+    # 3. Compare weights after the update
+    # updated_critic_weights = policy_net.fc_value[0].weight.data.clone()
+
+    # Calculate detailed metrics
+    # weight_diff_L1 = torch.sum(torch.abs(updated_critic_weights - initial_critic_weights)).item()
+    # norm_initial = torch.norm(initial_critic_weights).item()
+    # norm_updated = torch.norm(updated_critic_weights).item()
+    # relative_change = (weight_diff_L1 / norm_initial) * 100 if norm_initial > 0 else 0
+
+    # print("\n" + "=" * 60)
+    # print("PPO Critic Gradient Verification Results:")
+    # print(f"  - Initial Critic Weight Norm (L2) : {norm_initial:.6f}")
+    # print(f"  - Updated Critic Weight Norm (L2) : {norm_updated:.6f}")
+    # print(f"  - Total Absolute Difference (L1)  : {weight_diff_L1:.6f}")
+    # print(f"  - Relative Weight Change          : {relative_change:.4f}%")
+
+    # if weight_diff_L1 > 1e-6:
+        # print("  => Validation PASSED: Critic weights successfully updated.")
+        # print("  => Proof: The gradient is flowing and the network is learning.")
+    # else:
+        # print("  => Validation FAILED: Critic weights did NOT update.")
+        # print("  => Error: Gradient flow is still blocked.")
+    # print("=" * 60 + "\n")
+
+
+
     print("Starting training...")
     rewards = ppo.learn(total_timesteps=10000)
 
@@ -784,6 +930,8 @@ def main():
         'edge_index': edge_index
     }, "warehouse_optimization_model.pth")
 
+    policy_net.load_state_dict(torch.load("best_model.pth", map_location=device))
+    policy_net.eval()
     apply_dynamic_adjustment(policy_net, env, warehouse_data_loader)
 
 
